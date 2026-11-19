@@ -5,7 +5,6 @@
 // You may not use this work except in compliance with the Licence.
 // You may obtain a copy of the Licence at: https://joinup.ec.europa.eu/collection/eupl/eupl-text-eupl-12
 
-
 use std::env;
 use std::fs::{self, DirBuilder, Permissions};
 use std::io::{self, BufRead, Write};
@@ -19,7 +18,7 @@ use std::time::Duration;
 use symlink::{symlink_auto, symlink_dir};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("rad-portable, ");
+    println!("rad-portable, copyright (C) 2026 MLC 'Strawmelonjuice' Bloeiman and contributors.");
     let mut args = env::args().skip(1);
     // Grab the given path or...
     let raw_storage = PathBuf::from(
@@ -178,7 +177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("failed to set universal RAD_HOME in fish".into());
     }
 
-    let _ = stop_rad_node(Some(&runtime_dir));
+    let _ = stop_rad_node(Some(runtime_dir));
     let start_status = Command::new("rad")
         .args(["node", "start"])
         .env("RAD_HOME", &runtime_dir_str)
@@ -271,7 +270,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!(
                                 "No longer able to watch Radicle node: `rad node status` exited with non-zero error code."
                             );
-                            eprintln!("`rad stop` will no longer automatically stop radicle-portable.");
+                            eprintln!(
+                                "`rad stop` will no longer automatically stop radicle-portable."
+                            );
                             break;
                         }
                         let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -342,9 +343,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| "exit reason mutex poisoned")?
         .clone();
 
+    // shut down and cleanup time
     eprintln!("Stopping node ({reason})...");
     {
-        let runtime_dir: &Path = &runtime_dir;
+        let runtime_dir: &Path = runtime_dir;
         let _ = stop_rad_node(Some(runtime_dir));
         if let Ok(node_dir) = fs::canonicalize(runtime_dir.join("./node")) {
             let node_store_dir = storage_data_dir.join("./node");
