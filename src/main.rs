@@ -438,39 +438,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn stop_rad_node(runtime_dir: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
-    let status = match runtime_dir {
-        Some(dir) => Command::new("fish")
-            .args([
-                "-c",
-                &format!(
-                    "RAD_HOME='{}' rad node stop",
-                    dir.to_str()
-                        .unwrap_or("~/.radicle")
-                        .replace('\\', "\\\\")
-                        .replace('\'', "\\'")
-                ),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?,
-        None => Command::new("fish")
-            .args(["-c", "rad node stop"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?,
-    };
+    // Let's start by checking if the targeted node is even running.
 
-    if !status.success() {
-        let s = Command::new("pkill")
-            .args(["-x", "radicle-node"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        if s.is_ok_and(|code| code.success()) {
-            eprintln!("Failed peacefully shutting down radicle node, killed process instead.");
+    let cmd: String = match runtime_dir {
+        Some(runtime_directory) => {
+            format!(
+                "RAD_HOME='{}' rad node status | grep 'Node is'",
+                format!("{}", runtime_directory.display())
+                    .replace('\\', "\\\\")
+                    .replace('\'', "\\'")
+            )
+        }
+        _ => "rad node status | grep 'Node is'".to_string(),
+    };
+    match Command::new("fish")
+        .args(["-c", cmd.as_str()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(output) => {
+            if !output.status.success() {
+                return Err(
+                    "`rad node status` exited with non-zero error code, which means radicle-portable cannot peacefully shut it down.".into()
+                );
+            }
+            let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if raw.is_empty() {
+                return Err(
+                    "`rad node status` had some unparseable output, which means radicle-portable cannot peacefully shut it down.".into()
+                );
+            } else if !raw.contains("running with") {
+                return Ok(());
+            }
+
+            let status = match runtime_dir {
+                Some(dir) => Command::new("fish")
+                    .args([
+                        "-c",
+                        &format!(
+                            "RAD_HOME='{}' rad node stop",
+                            dir.to_str()
+                                .unwrap_or("~/.radicle")
+                                .replace('\\', "\\\\")
+                                .replace('\'', "\\'")
+                        ),
+                    ])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()?,
+                _ => Command::new("fish")
+                    .args(["-c", "rad node stop"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()?,
+            };
+
+            if !status.success() {
+                return Err("Failed peacefully shutting down radicle node.".into());
+            }
+            Ok(())
+        }
+        Err(_) => {
+            Err(
+                "`rad node status` exited with non-zero error code, which means radicle-portable cannot peacefully shut it down.".into()
+            )
         }
     }
-    Ok(())
 }
 
 unsafe extern "C" {
