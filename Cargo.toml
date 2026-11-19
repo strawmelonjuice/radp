@@ -1,0 +1,15 @@
+[package]
+name = "rad-portable"
+description = "Safely allows you to use a radicle node that stores on a portable device."
+authors = ["MLC (Mar) Bloeiman <strawmelonjuice@proton.me>"]
+license = "EUPL-1.2"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "rad-portable"
+path = "src/main.rs"
+
+
+[dependencies]
+symlink = "0.1.0"
