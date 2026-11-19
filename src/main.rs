@@ -346,6 +346,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let runtime_dir: &Path = &runtime_dir;
         let _ = stop_rad_node(Some(runtime_dir));
+        if let Ok(node_dir) = fs::canonicalize(runtime_dir.join("./node")) {
+            let node_store_dir = storage_data_dir.join("./node");
+            for entry in fs::read_dir(&node_dir)? {
+                let entry = entry?;
+                let src = entry.path();
+
+                if let (Ok(name), Ok(meta)) =
+                    (entry.file_name().into_string(), fs::symlink_metadata(&src))
+                {
+                    if meta.file_type().is_symlink() || !name.contains("log") {
+                        continue;
+                    };
+                    let dest = node_store_dir.join(&name);
+                    match fs::copy(&src, &dest) {
+                        Ok(..) => {
+                            println!(
+                                "Copied log file - {}",
+                                // &src.display()
+                                &name
+                            )
+                        }
+                        Err(er) => {
+                            eprintln!("Couldn't copy log file - {}: {}", &name, er)
+                        }
+                    };
+                } else {
+                    continue;
+                };
+            }
+        }
+
         match original_rad_home {
             Some(original_runtime_dir) if runtime_dir != original_runtime_dir => {
                 println!(
@@ -368,6 +399,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .status();
             }
         }
+
         let Ok(meta) = fs::symlink_metadata(runtime_dir) else {
             return Ok(());
         };
