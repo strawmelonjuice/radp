@@ -1,6 +1,8 @@
-﻿# radicle-portable
+﻿# radicle-portable / radp
 
-Safely allows you to use a radicle node that stores on a portable device.
+_Safely allows you to use a radicle node that stores on a portable device!_
+**Yes this means one radicle identity useable on multiple devices.** :3
+
 
 ## Why
 I previously used a lil btrfs portable drive, because well, exfat doesn't support unix domain sockets... However, I might
@@ -20,4 +22,4 @@ if it exists, start your local radicle node, usually the one in `~/.radicle`. Yo
 You can also just hit `[ENTER]` if rad-portable is running in a terminal window. Gives you more overview anyways.
 
 ## What you need
-Grep, and fish, and obviously radicle.
+Fish, and obviously radicle.
