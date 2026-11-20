@@ -366,11 +366,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!(
                                 "Copied log file - {}",
                                 // &src.display()
-                                &name
+                                name
                             )
                         }
                         Err(er) => {
-                            eprintln!("Couldn't copy log file - {}: {}", &name, er)
+                            eprintln!("Couldn't copy log file - {}: {}", name, er)
                         }
                     };
                 } else {
