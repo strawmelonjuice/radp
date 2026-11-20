@@ -438,7 +438,7 @@ fn cleanup_session(
         _ => {
             eprintln!("Resetting RAD_HOME.");
             match Command::new("fish")
-                .args(["-c", "set -e RAD_HOME"])
+                .args(["-c", "set -Ue RAD_HOME"])
                 .status()
             {
                 Ok(status) if status.success() => {}
@@ -531,8 +531,6 @@ unsafe extern "C" {
     fn getppid() -> i32;
 }
 
-
-#[cfg(test)]
 mod tests {
     use super::{copy_new_logs, create_runtime_dir, is_missing_profile_error};
     use std::fs;
