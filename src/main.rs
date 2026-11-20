@@ -7,15 +7,17 @@
 
 use std::env;
 use std::fs::{self, DirBuilder, Permissions};
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::thread;
 use std::time::Duration;
 use symlink::{symlink_auto, symlink_dir};
+
+static TERMINATION_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("rad-portable, copyright (C) 2026 MLC 'Strawmelonjuice' Bloeiman and contributors.");
@@ -43,8 +45,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    let initial_dev = storage_meta.dev();
-
     let storage_data_dir = if storage_root.file_name().is_some_and(|n| n == "data") {
         storage_root.clone()
     } else {
@@ -83,10 +83,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Using portable data directory: {}",
         canonical_data_dir.display()
     );
+    let storage_dev = fs::symlink_metadata(&canonical_data_dir)?.dev();
 
     // Okay now we ready to get cracking. Wait who are we!?
     let uid = unsafe { getuid() };
     let ppid = unsafe { getppid() };
+    install_termination_handlers()?;
+    if let Some(signal) = take_termination_signal() {
+        eprintln!("Received {} before startup; exiting.", signal_name(signal));
+        return Ok(());
+    }
 
     // Stop any node if it's there and we don't know about it.
     let original_rad_home = {
@@ -112,6 +118,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
+    if let Some(signal) = take_termination_signal() {
+        eprintln!("Received {} before startup; exiting.", signal_name(signal));
+        return Ok(());
+    }
     let runtime_base = env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(env::temp_dir);
@@ -124,8 +134,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime_node_dir = runtime_dir.join("node");
 
     let mut restart_local_node = false;
+    let mut fish_rad_home_set = false;
     let session_result = (|| -> Result<(), Box<dyn std::error::Error>> {
         restart_local_node = stop_rad_node(None)?;
+        if let Some(signal) = take_termination_signal() {
+            eprintln!("Received {} during startup.", signal_name(signal));
+            return Ok(());
+        }
         fs::create_dir_all(&runtime_node_dir)?;
         eprint!("Linking Radicle home...");
         for entry in fs::read_dir(&canonical_data_dir)? {
@@ -150,10 +165,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         eprintln!("\rLinked Radicle home.");
 
+        if let Some(signal) = take_termination_signal() {
+            eprintln!("Received {} during startup.", signal_name(signal));
+            return Ok(());
+        }
+        fish_rad_home_set = true;
         if !set_fish_rad_home(runtime_dir)? {
             return Err("failed to set universal RAD_HOME in fish".into());
         }
+        if let Some(signal) = take_termination_signal() {
+            eprintln!("Received {} during startup.", signal_name(signal));
+            return Ok(());
+        }
         stop_rad_node(Some(runtime_dir))?;
+        if let Some(signal) = take_termination_signal() {
+            eprintln!("Received {} during startup.", signal_name(signal));
+            return Ok(());
+        }
         eprintln!("Starting portable node in {}", runtime_dir.display());
         let start_status = Command::new("rad")
             .args(["node", "start"])
@@ -185,27 +213,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     match fs::symlink_metadata(&watch_path) {
                         Err(_) => {
-                            *exit_reason.lock().unwrap() =
-                                format!("storage path disappeared: {}", watch_path.display());
-                            stop_flag.store(true, Ordering::SeqCst);
+                            request_stop(
+                                &stop_flag,
+                                &exit_reason,
+                                format!("storage path disappeared: {}", watch_path.display()),
+                            );
                             break;
                         }
                         Ok(meta) => {
-                            if !meta.is_dir() || meta.dev() != initial_dev {
-                                *exit_reason.lock().unwrap() = format!(
-                                    "storage unmounted or remounted (dev {} -> {})",
-                                    initial_dev,
-                                    meta.dev()
+                            if !meta.is_dir() || meta.dev() != storage_dev {
+                                request_stop(
+                                    &stop_flag,
+                                    &exit_reason,
+                                    format!(
+                                        "storage unmounted or remounted (dev {} -> {})",
+                                        storage_dev,
+                                        meta.dev()
+                                    ),
                                 );
-                                stop_flag.store(true, Ordering::SeqCst);
                                 break;
                             }
                         }
                     }
 
                     if !Path::new(&format!("/proc/{}", ppid)).exists() {
-                        *exit_reason.lock().unwrap() = format!("parent process {} exited", ppid);
-                        stop_flag.store(true, Ordering::SeqCst);
+                        request_stop(
+                            &stop_flag,
+                            &exit_reason,
+                            format!("parent process {} exited", ppid),
+                        );
                         break;
                     }
 
@@ -230,9 +266,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match rad_node_status(&rad_dir) {
                         Ok(Some(raw)) => {
                             if !raw.contains("running with") {
-                                *exit_reason.lock().unwrap() =
-                                    "The radicle node has externally been stopped.".to_string();
-                                stop_flag.store(true, Ordering::SeqCst);
+                                request_stop(
+                                    &stop_flag,
+                                    &exit_reason,
+                                    "The radicle node has externally been stopped.".to_string(),
+                                );
                                 break;
                             }
                             // It's still going!
@@ -259,41 +297,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
 
-        // User input watcher
-        {
-            let stop_flag = Arc::clone(&stop_flag);
-            let exit_reason = Arc::clone(&exit_reason);
-
-            thread::spawn(move || {
-                let stdin = io::stdin();
-                let mut lines = stdin.lock().lines();
-                let _ = lines.next();
-                if !stop_flag.swap(true, Ordering::SeqCst) {
-                    *exit_reason.lock().unwrap() = String::from("User input triggered stop");
-                }
-            });
-        }
-
         eprintln!("Active RAD_HOME: {}", runtime_dir.display());
         eprintln!(
             "Watching storage dev {} at {} (ppid {})",
-            initial_dev,
+            storage_dev,
             canonical_data_dir.display(),
             ppid
         );
-        eprintln!("Press Enter or run `rad node stop` to stop cleanly.");
+        // SIGINT,SIGTERM, SIGHUP and SIGQUIT all work.
+        eprintln!("Send [control+c] or run `rad node stop` to stop cleanly.");
         eprintln!();
         eprintln!(
             "If this drive gets prematurely disconnected, an attempt will be made to stop radicle before more damage occurs."
         );
 
         while !stop_flag.load(Ordering::Relaxed) {
+            if let Some(signal) = take_termination_signal() {
+                request_stop(
+                    &stop_flag,
+                    &exit_reason,
+                    format!("received {}", signal_name(signal)),
+                );
+                break;
+            }
             thread::sleep(Duration::from_millis(100));
         }
 
         let reason = exit_reason
             .lock()
-            .map_err(|_| "exit reason mutex poisoned")?
+            .unwrap_or_else(|error| error.into_inner())
             .clone();
 
         eprintln!("Stopping node ({reason})...");
@@ -303,9 +335,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cleanup_result = cleanup_session(
         runtime_dir,
-        &storage_data_dir,
+        &canonical_data_dir,
+        storage_dev,
         original_rad_home,
         restart_local_node,
+        fish_rad_home_set,
         uid,
     );
     match (session_result, cleanup_result) {
@@ -390,6 +424,48 @@ fn set_fish_rad_home(path: &Path) -> io::Result<bool> {
         .success())
 }
 
+fn install_termination_handlers() -> io::Result<()> {
+    for signal in [1, 2, 3, 15] {
+        let previous =
+            unsafe { signal_handler(signal, handle_termination_signal as *const () as usize) };
+        if previous == usize::MAX {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+extern "C" fn handle_termination_signal(signal: i32) {
+    TERMINATION_SIGNAL.store(signal, Ordering::SeqCst);
+}
+
+fn take_termination_signal() -> Option<i32> {
+    match TERMINATION_SIGNAL.swap(0, Ordering::SeqCst) {
+        0 => None,
+        signal => Some(signal),
+    }
+}
+
+fn signal_name(signal: i32) -> &'static str {
+    match signal {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        15 => "SIGTERM",
+        _ => "termination signal",
+    }
+}
+
+fn request_stop(stop_flag: &AtomicBool, exit_reason: &std::sync::Mutex<String>, reason: String) {
+    let mut exit_reason = exit_reason
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if !stop_flag.load(Ordering::Relaxed) {
+        *exit_reason = reason;
+        stop_flag.store(true, Ordering::SeqCst);
+    }
+}
+
 fn create_runtime_dir(base: &Path, pid: u32) -> io::Result<PathBuf> {
     let dir = base.join(format!("radp.{pid}"));
     let mut builder = DirBuilder::new();
@@ -413,37 +489,53 @@ fn create_runtime_dir(base: &Path, pid: u32) -> io::Result<PathBuf> {
 fn cleanup_session(
     runtime_dir: &Path,
     storage_data_dir: &Path,
+    storage_dev: u64,
     original_rad_home: Option<PathBuf>,
     restart_local_node: bool,
+    fish_rad_home_set: bool,
     uid: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut errors = Vec::new();
 
     if let Err(error) = stop_rad_node(Some(runtime_dir)) {
-        errors.push(format!("stopping portable node: {error}"));
+        errors.push(format!("stopping radicle-portable: {error}"));
     }
-    if let Err(error) = copy_new_logs(runtime_dir, storage_data_dir) {
-        errors.push(format!("persisting node logs: {error}"));
-    }
-
-    match original_rad_home.as_ref() {
-        Some(path) if path != runtime_dir => {
-            eprintln!("Restoring RAD_HOME to {}.", path.display());
-            match set_fish_rad_home(path) {
-                Ok(true) => {}
-                Ok(false) => errors.push("failed to restore RAD_HOME in fish".to_owned()),
-                Err(error) => errors.push(format!("restoring RAD_HOME in fish: {error}")),
+    match storage_on_device(storage_data_dir, storage_dev) {
+        Ok(true) => {
+            if let Err(error) = copy_new_logs(runtime_dir, storage_data_dir, storage_dev) {
+                errors.push(format!("persisting node logs: {error}"));
             }
         }
-        _ => {
-            eprintln!("Resetting RAD_HOME.");
-            match Command::new("fish")
-                .args(["-c", "set -Ue RAD_HOME"])
-                .status()
-            {
-                Ok(status) if status.success() => {}
-                Ok(_) => errors.push("failed to reset RAD_HOME in fish".to_owned()),
-                Err(error) => errors.push(format!("resetting RAD_HOME in fish: {error}")),
+        Ok(false) => {
+            eprintln!(
+                "Skipping log persistence: storage directory is unavailable or on a different device."
+            );
+        }
+        Err(error) => {
+            errors.push(format!("checking storage before log persistence: {error}"));
+        }
+    }
+
+    if fish_rad_home_set {
+        match original_rad_home.as_ref() {
+            Some(path) if path != runtime_dir => {
+                eprintln!("Restoring RAD_HOME to {}.", path.display());
+                match set_fish_rad_home(path) {
+                    Ok(true) => {}
+                    Ok(false) => errors.push("failed to restore RAD_HOME in fish".to_owned()),
+                    Err(error) => errors.push(format!("restoring RAD_HOME in fish: {error}")),
+                }
+            }
+            _ => {
+                eprintln!("Resetting RAD_HOME.");
+                match Command::new("fish")
+                    .args(["-c", "set -Ue RAD_HOME"])
+                    .status()
+                {
+                    Ok(status) if status.success() => {}
+                    Ok(_) => errors.push("failed to reset RAD_HOME in fish".to_owned()),
+                    Err(error) => errors.push(format!("resetting RAD_HOME in fish: {error}")),
+                }
             }
         }
     }
@@ -495,7 +587,15 @@ fn cleanup_session(
     }
 }
 
-fn copy_new_logs(runtime_dir: &Path, storage_data_dir: &Path) -> io::Result<()> {
+fn storage_on_device(storage_data_dir: &Path, expected_dev: u64) -> io::Result<bool> {
+    match fs::symlink_metadata(storage_data_dir) {
+        Ok(metadata) => Ok(metadata.is_dir() && metadata.dev() == expected_dev),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn copy_new_logs(runtime_dir: &Path, storage_data_dir: &Path, expected_dev: u64) -> io::Result<()> {
     let node_dir = match fs::canonicalize(runtime_dir.join("node")) {
         Ok(path) => path,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -517,8 +617,18 @@ fn copy_new_logs(runtime_dir: &Path, storage_data_dir: &Path) -> io::Result<()> 
         }
 
         if !created_storage_node_dir {
+            if !storage_on_device(storage_data_dir, expected_dev)? {
+                return Err(io::Error::other(
+                    "storage directory disappeared or changed device during log persistence",
+                ));
+            }
             fs::create_dir_all(&storage_node_dir)?;
             created_storage_node_dir = true;
+        }
+        if !storage_on_device(storage_data_dir, expected_dev)? {
+            return Err(io::Error::other(
+                "storage directory disappeared or changed device during log persistence",
+            ));
         }
         fs::copy(&source, storage_node_dir.join(&name))?;
         eprintln!("Copied log file - {}", name.to_string_lossy());
@@ -529,13 +639,21 @@ fn copy_new_logs(runtime_dir: &Path, storage_data_dir: &Path) -> io::Result<()> 
 unsafe extern "C" {
     fn getuid() -> u32;
     fn getppid() -> i32;
+    #[link_name = "signal"]
+    fn signal_handler(signal: i32, handler: usize) -> usize;
 }
 
+#[cfg(test)]
 mod tests {
-    use super::{copy_new_logs, create_runtime_dir, is_missing_profile_error};
+    use super::{
+        copy_new_logs, create_runtime_dir, handle_termination_signal, is_missing_profile_error,
+        request_stop, storage_on_device, take_termination_signal,
+    };
     use std::fs;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{MetadataExt, symlink};
     use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_directory() -> PathBuf {
@@ -561,7 +679,8 @@ mod tests {
         fs::write(runtime_node.join("node.log.3"), "new rotated log").unwrap();
         fs::write(runtime_node.join("socket-data"), "not a log").unwrap();
 
-        copy_new_logs(&root.join("runtime"), &root.join("storage")).unwrap();
+        let storage_dev = fs::symlink_metadata(root.join("storage")).unwrap().dev();
+        copy_new_logs(&root.join("runtime"), &root.join("storage"), storage_dev).unwrap();
 
         assert_eq!(
             fs::read_to_string(storage_node.join("node.log")).unwrap(),
@@ -573,6 +692,41 @@ mod tests {
         );
         assert!(!storage_node.join("socket-data").exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn storage_guard_rejects_a_different_device_before_copying() {
+        let root = test_directory();
+        let runtime_node = root.join("runtime/node");
+        let storage = root.join("storage");
+        fs::create_dir_all(&runtime_node).unwrap();
+        fs::create_dir(&storage).unwrap();
+        fs::write(runtime_node.join("node.log.1"), "new log").unwrap();
+
+        let storage_dev = fs::symlink_metadata(&storage).unwrap().dev();
+        assert!(!storage_on_device(&storage, storage_dev ^ 1).unwrap());
+        assert!(copy_new_logs(&root.join("runtime"), &storage, storage_dev ^ 1).is_err());
+        assert!(!storage.join("node").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn termination_signal_is_deferred_to_the_main_loop() {
+        handle_termination_signal(2);
+        assert_eq!(take_termination_signal(), Some(2));
+        assert_eq!(take_termination_signal(), None);
+    }
+
+    #[test]
+    fn stop_request_preserves_the_first_reason() {
+        let stop_flag = AtomicBool::new(false);
+        let exit_reason = Mutex::new(String::new());
+
+        request_stop(&stop_flag, &exit_reason, "first".to_owned());
+        request_stop(&stop_flag, &exit_reason, "second".to_owned());
+
+        assert!(stop_flag.load(Ordering::SeqCst));
+        assert_eq!(*exit_reason.lock().unwrap(), "first");
     }
 
     #[test]
